@@ -162,6 +162,62 @@ def raytrace(vertices, triangles, ray_origin, ray_direction, node):
     
     return result
 
+NODE_TYPE_MESH=1
+NODE_TYPE_MESH_CONTAINER_SPHERE = 2
+NODE_TYPE_MESH_TRIANGLE_REF = 3
+MESH_FLAG_NORMAL=1
+MESH_FLAG_TEX_COORDS=2
+MESH_FLAG_TANGENT=4
+MESH_FLAG_BITANGENT=8
+MESH_FLAG_TRANSFORM=16
+NODE_FLAG_CONTAINER=1
+NODE_FLAG_TRANSFORM=16
+
+def insert_node_in_storage(storage, node, mesh_address):
+    float_ptr = len(storage.data_float)
+    int_ptr = len(storage.data_int)
+    ref_ptr = len(storage.data_ptr)
+    node_ptr = len(storage.data_tree)
+
+    storage.data_tree.append([-1, -1, -1, ref_ptr])
+    storage.data_ptr.append([int_ptr, float_ptr])
+
+    if node.geometry == 'Sphere':
+        storage.data_int.append(NODE_TYPE_MESH_CONTAINER_SPHERE)
+        storage.data_float.extend([*list(node.center.flatten()), node.radius])
+    elif node.geometry == 'Triangle':
+        storage.data_int.append(NODE_TYPE_MESH_TRIANGLE_REF)
+        storage.data_int.append(node.index)
+    else:
+        raise ValueError('Unknown node geometry: %s' % (node.geometry))
+    
+    flags = 0
+    if node.container:
+        flags |= NODE_FLAG_CONTAINER
+    
+    storage.data_int.append(flags)
+
+    if node.container:
+        first_child_ref = len(storage.data_int)
+        storage.data_int.append(-1)
+
+    # This must happen at the end: no more appending to data_int and data_float during the recursion
+    if node.container:
+        child_ref_list = []
+        for child in node.children:
+            child_ref_list.append(insert_node_in_storage(storage, child, mesh_address))
+        if len(child_ref_list) > 0:
+            storage.data_int[first_child_ref] = child_ref_list[0]
+        for child_ref in child_ref_list:
+            storage.data_tree[child_ref][0] = node_ptr
+        for i in range(1, len(child_ref_list)):
+            storage.data_tree[child_ref_list[i]][1] = child_ref_list[i - 1]
+        for i in range(len(child_ref_list) - 1):
+            storage.data_tree[child_ref_list[i]][2] = child_ref_list[i + 1]
+    
+    return node_ptr
+
+
 def _main():
     count_vertices = int.from_bytes(sys.stdin.buffer.read(4), byteorder='little')
     count_normals = int.from_bytes(sys.stdin.buffer.read(4), byteorder='little')
@@ -174,51 +230,78 @@ def _main():
     data_faces = numpy.frombuffer(sys.stdin.buffer.read(count_faces * 3 * 3 * 4), dtype=numpy.uint32).reshape((count_faces, 3, 3))
     
     root_node = make_sphere_node(data_vertices, data_faces[:,:,0], numpy.arange(data_faces.shape[0]))
+    storage = Data(data_float=[], data_int=[], data_ptr=[], data_tree=[])
 
-    camera_origin = numpy.array([1.0, 1.0, 1.0], dtype=numpy.float32)
-    camera_forward = numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32) - camera_origin
-    camera_forward = camera_forward / numpy.linalg.norm(camera_forward)
-    camera_right = numpy.cross(camera_forward, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32))
-    camera_right = camera_right / numpy.linalg.norm(camera_right)
-    camera_up = numpy.cross(camera_forward, camera_right)
+    mesh_address = len(storage.data_ptr)
+    storage.data_ptr.append([len(storage.data_int), len(storage.data_float)])
+    storage.data_int.extend([NODE_TYPE_MESH, MESH_FLAG_NORMAL | MESH_FLAG_TEX_COORDS, len(storage.data_tree), count_vertices, count_normals, count_texture_coords, count_faces, *list(data_faces.flatten())])
+    storage.data_float.extend(list(data_vertices.flatten()))
+    storage.data_float.extend(list(data_normals.flatten()))
+    storage.data_float.extend(list(data_texture_coords.flatten()))
 
-    width = 640
-    height = 480
-    field_of_view = (60.0 * 0.5) / 180.0 * numpy.pi
-    aspect_ratio = float(width) / float(height)
-    diagonal_size = numpy.tan(field_of_view)
-    screen_height = diagonal_size / numpy.sqrt(1 + aspect_ratio * aspect_ratio)
-    screen_width = aspect_ratio * screen_height
+    insert_node_in_storage(storage, root_node, mesh_address)
 
-    world_screen_right = screen_width * camera_right
-    world_screen_up = screen_height * camera_up
+    storage.data_float = numpy.array(storage.data_float, dtype=numpy.float32)
+    storage.data_int = numpy.array(storage.data_int, dtype=numpy.int32)
+    storage.data_ptr = numpy.array(storage.data_ptr, dtype=numpy.int32)
+    storage.data_tree = numpy.array(storage.data_tree, dtype=numpy.int32)
 
-    color_data = []
+    sys.stdout.buffer.write(storage.data_float.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(storage.data_int.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(storage.data_ptr.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(storage.data_tree.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(mesh_address.to_bytes(4, 'little'))
+    sys.stdout.buffer.write(storage.data_float.tobytes('C'))
+    sys.stdout.buffer.write(storage.data_int.tobytes('C'))
+    sys.stdout.buffer.write(storage.data_ptr.tobytes('C'))
+    sys.stdout.buffer.write(storage.data_tree.tobytes('C'))
 
-    intersect_count = 0
+    j = 0
 
-    for y in range(height):
-        for x in range(width):
-            position = numpy.array([float(x) / float(width), float(y) / float(height)], dtype=numpy.float32)
-            position = position * 2.0 - 1.0
-            world_screen_center = camera_origin + camera_forward
-            world_screen_point = world_screen_center + position[0] * world_screen_right + position[1] * world_screen_up
-            ray_direction = world_screen_point - camera_origin
-            ray_direction = ray_direction / numpy.linalg.norm(ray_direction)
-            intersection = raytrace(data_vertices, data_faces[:,:,0], camera_origin, ray_direction, root_node)
-            if intersection is None:
-                color_data.append(numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32))
-            else:
-                intersect_count += 1
-                color_data.append(intersection.normal * 0.5 + 0.5)
-    # intersection = raytrace(data_vertices, data_faces[:,:,0], ray_origin, ray_direction, root_node)
-    color_data = numpy.array(color_data).reshape((height, width, 3))
-    color_data = (color_data * 255.0).astype(numpy.uint8)
-    image = Image.fromarray(color_data, mode='RGB')
-    image.save('test.png', format='PNG', optimize=True)
+    # camera_origin = numpy.array([1.0, 1.0, 1.0], dtype=numpy.float32)
+    # camera_forward = numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32) - camera_origin
+    # camera_forward = camera_forward / numpy.linalg.norm(camera_forward)
+    # camera_right = numpy.cross(camera_forward, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32))
+    # camera_right = camera_right / numpy.linalg.norm(camera_right)
+    # camera_up = numpy.cross(camera_forward, camera_right)
 
-    print('Average sphere intersection per pixel: %.3f' % (float(_sphere_intersection_count) / float(width * height)))
-    print('Average triangle intersection per pixel: %.3f' % (float(_triangle_intersection_count) / float(width * height)))
+    # width = 640
+    # height = 480
+    # field_of_view = (60.0 * 0.5) / 180.0 * numpy.pi
+    # aspect_ratio = float(width) / float(height)
+    # diagonal_size = numpy.tan(field_of_view)
+    # screen_height = diagonal_size / numpy.sqrt(1 + aspect_ratio * aspect_ratio)
+    # screen_width = aspect_ratio * screen_height
+
+    # world_screen_right = screen_width * camera_right
+    # world_screen_up = screen_height * camera_up
+
+    # color_data = []
+
+    # intersect_count = 0
+
+    # for y in range(height):
+    #     for x in range(width):
+    #         position = numpy.array([float(x) / float(width), float(y) / float(height)], dtype=numpy.float32)
+    #         position = position * 2.0 - 1.0
+    #         world_screen_center = camera_origin + camera_forward
+    #         world_screen_point = world_screen_center + position[0] * world_screen_right + position[1] * world_screen_up
+    #         ray_direction = world_screen_point - camera_origin
+    #         ray_direction = ray_direction / numpy.linalg.norm(ray_direction)
+    #         intersection = raytrace(data_vertices, data_faces[:,:,0], camera_origin, ray_direction, root_node)
+    #         if intersection is None:
+    #             color_data.append(numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32))
+    #         else:
+    #             intersect_count += 1
+    #             color_data.append(intersection.normal * 0.5 + 0.5)
+    # # intersection = raytrace(data_vertices, data_faces[:,:,0], ray_origin, ray_direction, root_node)
+    # color_data = numpy.array(color_data).reshape((height, width, 3))
+    # color_data = (color_data * 255.0).astype(numpy.uint8)
+    # image = Image.fromarray(color_data, mode='RGB')
+    # image.save('test.png', format='PNG', optimize=True)
+
+    # print('Average sphere intersection per pixel: %.3f' % (float(_sphere_intersection_count) / float(width * height)))
+    # print('Average triangle intersection per pixel: %.3f' % (float(_triangle_intersection_count) / float(width * height)))
 
 if __name__ == '__main__':
     _main()
