@@ -1,8 +1,13 @@
 import sys
 import numpy
+from numpy import dot, cross, sqrt, abs
 from PIL import Image
 
+numpy.set_printoptions(floatmode='maxprec', suppress=True)
 epsilon = numpy.finfo(numpy.float32).eps
+
+def normalize(v):
+    return v / numpy.linalg.norm(v)
 
 class Data:
     def __init__(self, **kwargs):
@@ -124,129 +129,278 @@ NODE_TYPE_MESH=1
 NODE_TYPE_CONTAINER=2
 NODE_TYPE_MESH_TRIANGLE=3
 
-MESH_FLAG_TRANSFORM=1
-MESH_FLAG_NORMALS=2
-MESH_FLAG_TEX_COORDS=4
-MESH_FLAG_TANGENT=8
-MESH_FLAG_BITANGENT=16
+MESH_FLAG_NORMALS=1
+MESH_FLAG_TEX_COORDS=2
+MESH_FLAG_TANGENT=4
+MESH_FLAG_BITANGENT=8
 
-NODE_GEOMETRY_SPHERE=1
+other_dim = [
+    [1, 2],
+    [0, 2],
+    [0, 1]
+]
 
-def raytrace_triangle(triangle, ray_origin, ray_direction):
+def action_raytrace_triangle(depth_out, barycentric_out, triangle, ray_origin, ray_direction):
     edge1 = triangle[1] - triangle[0]
     edge2 = triangle[2] - triangle[0]
     h = numpy.cross(ray_direction, edge2)
     a = numpy.dot(edge1, h)
     if numpy.abs(a) < epsilon:
-        return None
+        return False
     f = 1.0 / a
     s = ray_origin - triangle[0]
     u = f * numpy.dot(s, h)
     if u < 0.0 or u > 1.0:
-        return None
+        return False
     q = numpy.cross(s, edge1)
     v = f * numpy.dot(ray_direction, q)
     if v < 0.0 or u + v > 1.0:
-        return None
+        return False
     depth = f * numpy.dot(edge2, q)
     if depth < 0.0:
-        return None
+        return False
+    depth_out.set(depth)
+    barycentric_out.set(numpy.array([1.0 - u - v, u, v], dtype=numpy.float32))
+    return True
+
+class RayIntersection:
+    def __init__(self):
+        self.normal = numpy.array([0, 0, 0], dtype=numpy.float32)
+        self.depth = numpy.inf
+
+class NDArrayRef:
+    def __init__(self, array, *index):
+        if not isinstance(array, numpy.ndarray):
+            raise ValueError('Specified array is not numpy.ndarray')
+        if (len(index) > len(array.shape)):
+            raise IndexError('Number of indices %d is larger than number of dimensions %d' % (len(index), len(array.shape)))
+        self.__array = array
+        self.__index = index
+
+    def get(self):
+        ref = self.__array
+        for index in self.__index:
+            ref = ref[index]
+        return ref
     
-    return (depth, u, v)
+    def set(self, value):
+        ref = self.__array
+        for index in self.__index[:-1]:
+            ref = ref[index]
+        ref[self.__index[-1]] = value
 
-def raytrace_sphere(sphere_origin, sphere_radius, ray_origin, ray_direction, dot_ray_origin_ray_direction):
-    sphere_vector = sphere_origin - ray_origin
-    b = 2.0 * (dot_ray_origin_ray_direction - numpy.dot(ray_direction, sphere_origin))
-    c = numpy.dot(sphere_vector, sphere_vector) - sphere_radius * sphere_radius
+def action_raytrace_container(depth_out, node_origin, node_radius, node_axes, ray_origin, ray_direction, dot_ray_origin_ray_direction):
+    s = node_origin - ray_origin
+    b = 2.0 * (dot_ray_origin_ray_direction - dot(node_origin, ray_direction))
+    c = dot(s, s) - node_radius * node_radius
+
     D = b * b - 4 * c
-    if D < 0:
-        return None
-    depth = (-b - numpy.sqrt(D)) * 0.5
-    if depth >= 0.0:
-        return depth
-    depth = (-b + numpy.sqrt(D)) * 0.5
-    if depth >= 0.0:
-        return depth
-    return None
+    if D < 0.0:
+        return False
+    depth = (-b - sqrt(D)) * 0.5
+    if depth < 0.0:
+        depth = (-b + sqrt(D)) * 0.5
+        if depth < 0.0:
+            return False
+    
+    # mat_box_transform = numpy.array([
+    #     [node_axes[0], 0.0, 0.0, node_origin[0]],
+    #     [0.0, node_axes[1], 0.0, node_origin[1]],
+    #     [0.0, 0.0, node_axes[2], node_origin[2]],
+    #     [0.0, 0.0, 0.0, 1.0]
+    # ], dtype=numpy.float32)
 
-def execute_shader(data, start_index, camera, x, y, width, height):
-    position = numpy.array([float(x) / float(width), float(y) / float(height)], dtype=numpy.float32)
+    # mat_box_inv_transform = numpy.array([
+    #     [1.0 / node_axes[0], 0.0, 0.0, -node_origin[0] / node_axes[0]],
+    #     [0.0, 1.0 / node_axes[1], 0.0, -node_origin[1] / node_axes[1]],
+    #     [0.0, 0.0, 1.0 / node_axes[2], -node_origin[2] / node_axes[2]],
+    #     [0.0, 0.0, 0.0, 1.0]
+    # ], dtype=numpy.float32)
+
+    # This is multiplication (*) in shader, but numpy makes mat-vec multiplication using numpy.dot
+    # box_ray_origin = numpy.dot(mat_box_inv_transform, [*ray_origin, 1.0])[0:3]
+    # box_ray_direction = normalize(numpy.dot(mat_box_inv_transform, [*(ray_origin + ray_direction), 1.0])[0:3] - box_ray_origin)
+    has_box_intersection = False
+    depth = numpy.inf
+    for dim in range(3):
+        if abs(ray_direction[dim]) < epsilon:
+            continue
+        for dir in [-1.0, 1.0]:
+            # Normal is: N = [0.0, 0.0, 0.0]; N[dim] = 1.0;
+            # then: dot(normal, ray_origin) == ray_origin[dim]
+            # and: dot(normal, ray_direction) == ray_direction[dim]
+            # Thus intersection: (plane_factor - dot(normal, ray_origin)) / dot(normal, ray_direction)
+            # Where plane_factor is: dot(normal, node_origin ± node_axes)
+            # then: plane_factor = node_origin[dim] ± node_axes[dim]
+            # unless ray_direction lies in the plane of the normal, in which case the below is division by 0.0
+            plane_factor = node_origin[dim] + dir * node_axes[dim]
+            box_depth = (plane_factor - ray_origin[dim]) / ray_direction[dim]
+            if box_depth >= 0.0:
+                hit_point = ray_origin + box_depth * ray_direction
+                plane_center = numpy.array(node_origin)
+                plane_center[dim] = plane_factor
+                plane_vector = hit_point - plane_center
+                if numpy.abs(plane_vector[other_dim[dim][0]]) <= node_axes[other_dim[dim][0]] and numpy.abs(plane_vector[other_dim[dim][1]]) <= node_axes[other_dim[dim][1]]:
+                    depth = numpy.minimum(box_depth, depth)
+                    has_box_intersection = True
+    if has_box_intersection:
+        depth_out.set(depth)
+    return has_box_intersection
+
+
+    (numpy.array([1.0, 1.0, 1.0]) - box_ray_origin) / box_ray_direction
+
+total_invocation_count = 0
+
+def execute_shader(color_out, scene_float, scene_int, scene_object, scene_tree, uniform_data, invocation_id):
+    global total_invocation_count
+    # Compute shader executes in workgroups, each workgroup with specific integer size.
+    # As workgroup size might not divide width and height, some invocation might be out-of-bounds (severe minority of invocations)
+    if invocation_id[0] >= uniform_data.image_size[0] or invocation_id[1] >= uniform_data.image_size[1]:
+        return
+    
+    position = numpy.array([
+        (float(invocation_id[0]) + 0.5) / float(uniform_data.image_size[0]),
+        (float(invocation_id[1]) + 0.5) / float(uniform_data.image_size[1]),
+    ], dtype=numpy.float32)
     position = position * 2.0 - 1.0
-    world_screen_point = camera.screen.center + position[0] * camera.screen.right + position[1] * camera.screen.up
-    ray_direction = world_screen_point - camera.origin
-    ray_direction = ray_direction / numpy.linalg.norm(ray_direction)
-    ray_origin = camera.origin
-    dot_ray_origin_ray_direction = numpy.dot(ray_origin, ray_direction)
+    world_screen_point = uniform_data.screen_center + position[0] * uniform_data.screen_right + position[1] * uniform_data.screen_up
+    ray_origin = uniform_data.camera_origin
+    ray_direction = normalize(world_screen_point - ray_origin)
+    dot_ray_origin_ray_direction = dot(ray_origin, ray_direction)
+    
+    current_node_index = uniform_data.start_node_index
+    has_intersection = False
+    intersection = RayIntersection()
+    current_mesh = Data(
+        index = -1,
+        item_count = 0,
+        flags = 0,
+        normal_ptr = -1,
+        texcoord_ptr = -1,
+        tangent_ptr = -1,
+        bitangent_ptr = -1,
+        vertex_ptr = -1,
+        triangle_ptr = -1
+    )
 
-    current_node_index = start_index
-    current_intersection = None
-    current_mesh_index = -1
-    node_processed = 0
+    local_invocation_count = 0
+
     while current_node_index != -1:
-        node_processed += 1
-        current_node = data.tree[current_node_index]
-        current_object = data.object[current_node[3]]
+        print('%d: [%d, %d]: %d = %d' % (total_invocation_count, invocation_id[0], invocation_id[1], local_invocation_count, current_node_index))
+        total_invocation_count += 1
+        local_invocation_count += 1
+        current_node = scene_tree[current_node_index]
+        current_object = scene_object[current_node[3]]
 
         if current_object[0] == NODE_TYPE_MESH:
-            current_mesh_index = current_node_index
-            current_node_index = data.int[current_object[2] + 1]
+            current_mesh.index = current_node_index
+            current_node_index = scene_int[current_object[2] + 1]
+            current_mesh.flags = current_object[1]
+            float_offset = current_object[3]
+            int_offset = current_object[2] + 4
+            current_mesh.item_count = 1
+            current_mesh.vertex_ptr = float_offset
+            float_offset += scene_int[current_object[2] + 2] * 3
+            for i in range(0, 4):
+                if (current_mesh.flags & (1 << i)) != 0:
+                    current_mesh.item_count += 1
+                    if i == 0:
+                        current_mesh.normal_ptr = float_offset
+                        float_offset += scene_int[int_offset] * 3
+                    elif i == 1:
+                        current_mesh.texcoord_ptr = float_offset
+                        float_offset += scene_int[int_offset] * 2
+                    elif i == 2:
+                        current_mesh.tangent_ptr = float_offset
+                        float_offset += scene_int[int_offset] * 3
+                    elif i == 3:
+                        current_mesh.bitangent_ptr = float_offset
+                        float_offset += scene_int[int_offset] * 3
+                    int_offset += 1
+            current_mesh.triangle_ptr = current_object[2] + 3 + current_mesh.item_count
             continue
         elif current_object[0] == NODE_TYPE_CONTAINER:
             relevant = False
-            geometry = data.int[current_object[2] + 0]
-            if geometry == NODE_GEOMETRY_SPHERE:
-                # print('Sphere: { center: [%.6f, %.6f, %.6f], radius: %.6f }' % (data.float[current_object[3] + 0], data.float[current_object[3] + 1], data.float[current_object[3] + 2], data.float[current_object[3] + 3]))
-                depth = raytrace_sphere(
-                    data.float[current_object[3] + 0:current_object[3] + 3],
-                    data.float[current_object[3] + 3],
-                    ray_origin,
-                    ray_direction,
-                    dot_ray_origin_ray_direction
-                )
-                if depth is not None:
-                    relevant = True
-            else:
-                raise RuntimeError('Unsupported geometry: %d' % (geometry))
+            depth = None
+            # WSGL uses &depth to pass ptr<function, f32> that can be written in the function
+            # Python has better mechanisms to handle that, but to avoid huge difference between simulated shader code and actual WGSL
+            # we prefer creating a pointer, instead of using numpy with complex indexing or complex return types (something we cannot do in WGSL)
+            def get_depth():
+                nonlocal depth
+                return depth
+            def set_depth(value):
+                nonlocal depth
+                depth = value
+            if action_raytrace_container(
+                Data(get=get_depth, set=set_depth),
+                numpy.array([scene_float[current_object[3] + 0], scene_float[current_object[3] + 1], scene_float[current_object[3] + 2]], dtype=numpy.float32),
+                scene_float[current_object[3] + 3],
+                numpy.array([scene_float[current_object[3] + 4], scene_float[current_object[3] + 5], scene_float[current_object[3] + 6]], dtype=numpy.float32),
+                ray_origin,
+                ray_direction,
+                dot_ray_origin_ray_direction
+            ):
+                relevant = True
             if relevant:
-                if current_intersection is not None and depth >= current_intersection.depth:
+                if has_intersection and depth >= intersection.depth:
                     relevant = False
-                if relevant:
-                    current_node_index = current_object[1]
-                    continue
+            if relevant:
+                current_node_index = current_object[1]
+                continue
         elif current_object[0] == NODE_TYPE_MESH_TRIANGLE:
             relevant = False
-            mesh_node = data.tree[current_mesh_index]
-            mesh = data.object[mesh_node[3]]
-            data_flags = (mesh[1] >> 1) & 0xF
-            data_item_count = 0
-            # For shader do not use while loop, use loop from 1 to 5 and if (flags & (1 << i)) increase data.
-            while data_flags != 0:
-                data_item_count += 1
-                data_flags = data_flags >> 1
-            # Note: this is python specific, for an actual shader, here it will be faster to directly get 3 indices and then 3 vertices, potentially with repeated code;
-            triangle_indices = data.int[mesh[2] + 4 + data_item_count : mesh[2] + 4 + data_item_count + data.int[3] * (1 + data_item_count) * 3].reshape(data.int[3], 3, 1 + data_item_count)[current_object[1]][:,0]
-            triangle_vertices = data.float[0 : data.int[mesh[2] + 2] * 3].reshape(data.int[mesh[2] + 2], 3)[triangle_indices]
-            # print('Triangle: { 0: [%.6f, %.6f, %.6f], 1: [%.6f, %.6f, %.6f], 2: [%.6f, %.6f, %.6f] }' % (triangle_vertices[0][0], triangle_vertices[0][1], triangle_vertices[0][2], triangle_vertices[1][0], triangle_vertices[1][1], triangle_vertices[1][2], triangle_vertices[2][0], triangle_vertices[2][1], triangle_vertices[2][2]))
-            triangle_intersection = raytrace_triangle(triangle_vertices, ray_origin, ray_direction)
-            if triangle_intersection is not None:
+            depth = None
+            barycentric = None
+            triangle_vertices = numpy.array([
+                [
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 0 * current_mesh.item_count] * 3 + 0],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 0 * current_mesh.item_count] * 3 + 1],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 0 * current_mesh.item_count] * 3 + 2],
+                ],
+                [
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 1 * current_mesh.item_count] * 3 + 0],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 1 * current_mesh.item_count] * 3 + 1],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 1 * current_mesh.item_count] * 3 + 2],
+                ],
+                [
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 2 * current_mesh.item_count] * 3 + 0],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 2 * current_mesh.item_count] * 3 + 1],
+                    scene_float[current_mesh.vertex_ptr + scene_int[current_mesh.triangle_ptr + current_object[1] * current_mesh.item_count * 3 + 2 * current_mesh.item_count] * 3 + 2],
+                ]
+            ], dtype=numpy.float32)
+            def get_depth():
+                nonlocal depth
+                return depth
+            def set_depth(value):
+                nonlocal depth
+                depth = value
+            def get_barycentric():
+                nonlocal barycentric
+                return barycentric
+            def set_barycentric(value):
+                nonlocal barycentric
+                barycentric = value
+            if action_raytrace_triangle(
+                Data(get=get_depth, set=set_depth),
+                Data(get=get_barycentric, set=set_barycentric),
+                triangle_vertices,
+                ray_origin,
+                ray_direction
+            ):
                 relevant = True
-                if current_intersection is not None and triangle_intersection[0] >= current_intersection.depth:
+            if relevant:
+                if has_intersection and depth >= intersection.depth:
                     relevant = False
-                if relevant:
-                    normal = numpy.cross(triangle_vertices[2] - triangle_vertices[0], triangle_vertices[1] - triangle_vertices[0])
-                    normal = normal / numpy.linalg.norm(normal)
-                    # Barycentric here need does not need to be stored in the shader
-                    # The shader can use barycentric here to compute the interpolated normals, texture coordinates, tangent and bitangent,
-                    # for the point of intersection.
-                    # Additional flags for smoothing can potentially affect the normal.
-                    current_intersection = Data(
-                        depth=triangle_intersection[0],
-                        normal=normal,
-                        hit_point=ray_origin + triangle_intersection[0] * ray_direction
-                    )
+            if relevant:
+                has_intersection = True
+                intersection.depth = depth
+                intersection.normal = normalize(cross(triangle_vertices[2] - triangle_vertices[0], triangle_vertices[1] - triangle_vertices[0]))
+                if dot(ray_direction, intersection.normal) >= 0.0:
+                    intersection.normal = -intersection.normal
         else:
-            raise RuntimeError('Unsupported node type: %d' % (current_object[0]))
-
+            raise ValueError('Unexpected node type: %d' % (current_object[0]))
+        
         current_node_index = -1
         while True:
             if current_node[2] != -1:
@@ -254,60 +408,56 @@ def execute_shader(data, start_index, camera, x, y, width, height):
                 break
             if current_node[0] == -1:
                 break
-            current_node = data.tree[current_node[0]]
-    return current_intersection
+            current_node = scene_tree[current_node[0]]
+    
+    if has_intersection:
+        color_out.set(intersection.normal * 0.5 + 0.5)
+    else:
+        color_out.set([0.0, 0.0, 0.0])
 
 
 def _main():
-    start_index = int.from_bytes(sys.stdin.buffer.read(4), 'little')
+    start_node_index = int.from_bytes(sys.stdin.buffer.read(4), 'little')
     float_length = int.from_bytes(sys.stdin.buffer.read(4), 'little')
     int_length = int.from_bytes(sys.stdin.buffer.read(4), 'little')
     ptr_length = int.from_bytes(sys.stdin.buffer.read(4), 'little')
     tree_length = int.from_bytes(sys.stdin.buffer.read(4), 'little')
-    float_data = numpy.frombuffer(sys.stdin.buffer.read(float_length * 4), dtype=numpy.float32)
-    int_data = numpy.frombuffer(sys.stdin.buffer.read(int_length * 4), dtype=numpy.int32)
-    object_data = numpy.frombuffer(sys.stdin.buffer.read(ptr_length * 4 * 4), dtype=numpy.int32).reshape((ptr_length, 4))
-    tree_data = numpy.frombuffer(sys.stdin.buffer.read(tree_length * 4 * 4), dtype=numpy.int32).reshape((tree_length, 4))
+    scene_float = numpy.frombuffer(sys.stdin.buffer.read(float_length * 4), dtype=numpy.float32)
+    scene_int = numpy.frombuffer(sys.stdin.buffer.read(int_length * 4), dtype=numpy.int32)
+    scene_object = numpy.frombuffer(sys.stdin.buffer.read(ptr_length * 4 * 4), dtype=numpy.int32).reshape((ptr_length, 4))
+    scene_tree = numpy.frombuffer(sys.stdin.buffer.read(tree_length * 4 * 4), dtype=numpy.int32).reshape((tree_length, 4))
 
-    data = Data(float=float_data, int=int_data, object=object_data, tree=tree_data)
+    uniform_data = Data(
+        image_size = numpy.array([400, 300], dtype=numpy.int32),
+        start_node_index = start_node_index,
+        camera_origin = numpy.array([1.0, 1.0, 1.0], dtype=numpy.float32),
+        screen_center = None,
+        screen_right = None,
+        screen_up = None
+    )
 
-    camera_origin = numpy.array([1.0, 1.0, 1.0], dtype=numpy.float32)
-    camera_forward = numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32) - camera_origin
-    camera_forward = camera_forward / numpy.linalg.norm(camera_forward)
-    camera_right = numpy.cross(camera_forward, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32))
-    camera_right = camera_right / numpy.linalg.norm(camera_right)
+    camera_forward = normalize(numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32) - uniform_data.camera_origin)
+
+    camera_right = normalize(numpy.cross(camera_forward, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32)))
     camera_up = numpy.cross(camera_forward, camera_right)
-
-    width = 400
-    height = 300
     field_of_view = (60.0 * 0.5) / 180.0 * numpy.pi
-    aspect_ratio = float(width) / float(height)
+    aspect_ratio = float(uniform_data.image_size[0]) / float(uniform_data.image_size[1])
     diagonal_size = numpy.tan(field_of_view)
     screen_height = diagonal_size / numpy.sqrt(1 + aspect_ratio * aspect_ratio)
     screen_width = aspect_ratio * screen_height
-
-    world_screen_right = screen_width * camera_right
-    world_screen_up = screen_height * camera_up
-    world_screen_center = camera_origin + camera_forward
-
-    screen = Data(center=world_screen_center, right=world_screen_right, up=world_screen_up)
-    camera = Data(origin=camera_origin, forward=camera_forward, screen=screen)
-
-
+    uniform_data.screen_center = uniform_data.camera_origin + camera_forward
+    uniform_data.screen_right = screen_width * camera_right
+    uniform_data.screen_up = screen_height * camera_up
     # execute_shader(data, start_index, camera, width // 2, height // 2, width, height)
 
-    color_data = []
-    for y in range(height):
-        for x in range(width):
-            intersection = execute_shader(data, start_index, camera, x, y, width, height)
-            if intersection is not None:
-                color_data.append(intersection.normal * 0.5 + 0.5)
-            else:
-                color_data.append([0, 0, 0])
+    color_data = numpy.zeros((uniform_data.image_size[1], uniform_data.image_size[0], 3), dtype=numpy.float32)
+    for y in range(uniform_data.image_size[1]):
+        for x in range(uniform_data.image_size[0]):
+            global_invocation_id = numpy.array([x, y, 0], dtype=numpy.uint32)
+            execute_shader(NDArrayRef(color_data, y, x), scene_float, scene_int, scene_object, scene_tree, uniform_data, global_invocation_id)
 
-    color_data = numpy.array(color_data).reshape((height, width, 3))
-    color_data = (color_data * 255.0).astype(numpy.uint8)
-    image = Image.fromarray(color_data, mode='RGB')
+    image_data = (color_data * 255.0).astype(numpy.uint8)
+    image = Image.fromarray(image_data, mode='RGB')
     image.save('test.png', format='PNG', optimize=True)
     
 
