@@ -4,6 +4,8 @@ import numpy
 numpy.set_printoptions(floatmode='maxprec', suppress=True)
 epsilon = numpy.finfo(numpy.float32).eps
 
+vertex_attributes = numpy.dtype([('position', '3f8'), ('normal', '3f8'), ('texcoord', '2f8')])
+
 class Data:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -39,270 +41,224 @@ def v1_create_storage(source):
         index=rfl[ifl].reshape(source.shape)
     )
 
-def v1_create_node(storage, selected_triangle_index):
-    # TODO: If less than 6 triangles are selected, just add them to the node, no need to split
-    triangles = storage.index[selected_triangle_index]
-    triangle_vertices = triangles[:, :, vertex_position]
-    uvx, vx_triangles = numpy.unique(triangle_vertices.reshape((-1, 3)), axis=0, return_inverse=True)
-    vx_triangles = vx_triangles.reshape(triangle_vertices.shape[0:2])
-    split_info = [None] * 3
-    split_dim = -1
-    split_separation_count = numpy.inf
-    for dim in range(3):
-        split = split_info[dim] = Data()
-        split.vertex_rejection = storage.float[uvx][:, dim]
-        split.plane_factor = numpy.median(split.vertex_rejection)
-        split.normal = numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32)
-        split.normal[dim] = 1.0
-        split.point = numpy.array([0.0, 0.0, 0.0], dtype=numpy.float32)
-        split.point[dim] = split.plane_factor
-        split.triangle_rejection = storage.float[storage.index[:, :, vertex_position[dim]]]
-        split.is_plane_index = numpy.abs(split.triangle_rejection - split.plane_factor) < epsilon
-        split.is_left_index = numpy.logical_and(numpy.logical_not(split.is_plane_index), split.triangle_rejection < split.plane_factor)
-        split.is_right_index = numpy.logical_and(numpy.logical_not(split.is_plane_index), split.triangle_rejection >= split.plane_factor)
-        split.groups = [
-            numpy.argwhere(numpy.all(split.is_left_index, axis=-1))[:, 0],
-            numpy.argwhere(numpy.all(split.is_right_index, axis=-1))[:, 0],
-        ]
-        split.offending = numpy.delete(numpy.arange(split.triangle_rejection.shape[0]), numpy.union1d(split.groups[0], split.groups[1]))
-        # Offending triangles vertices are in 3 groups:
-        # Plane vertices lies near the split plane;
-        # Left vertices dot(normal, vertex) < plane_factor
-        # Right vertices dot(normal, vertex) > plane_factor
-
-        # Triangle can have:
-        # 3 plane vertices = triangle lies on the plane, assign the triangle to the smaller group:
-        # - Vertices might move epsilon distance to fit in the box;
-        # Note: because plane triangles can apply to each group, they do not count to the imbalance.
-        # 2 plane vertices = one vertex is not plane, it determines which group the triangle belongs;
-        # 1 plane vertex:
-        # Case 1: The other two vertices are in the same half-space = assign the triangle to that group;
-        # Case 2: The other two vertices are in the opposite half-space = split the triangle in two;
-        # 0 plane vertices:
-        # Have a lonely vertex in one half-space and couple vertices in the other half-space,
-        # the triangle is split on edges connecting the lonely vertex.
-
-        split.separation_count = 0
-        split.distribution = numpy.array(list(x.shape[0] for x in split.groups))
-        split.offending_has_plane_vertex = list(numpy.argwhere(numpy.count_nonzero(split.is_plane_index[split.offending], axis=-1) == i)[:, 0] for i in range(4))
-        # 3 plane vertices: triangle can go into either group, so we store this count separately;
-        split.free_distribution = numpy.count_nonzero(numpy.any(split.is_left_index[split.offending[split.offending_has_plane_vertex[2]]], axis=-1))
-        # 2 plane vertices: the triangle goes into the group where the non-plane vertex is located.
-        split.distribution[0] += numpy.count_nonzero(numpy.any(split.is_left_index[split.offending[split.offending_has_plane_vertex[2]]], axis=-1))
-        split.distribution[1] += numpy.count_nonzero(numpy.any(split.is_right_index[split.offending[split.offending_has_plane_vertex[2]]], axis=-1))
-        # 1 plane vertex: has two possible cases
-        # Case 1: The two non-plane verties are in the same group - put the triangle into that group
-        split.distribution[0] += split.offending[split.offending_has_plane_vertex[1]][numpy.count_nonzero(split.is_left_index[split.offending[split.offending_has_plane_vertex[1]]], axis=-1) == 2].shape[0]
-        split.distribution[1] += split.offending[split.offending_has_plane_vertex[1]][numpy.count_nonzero(split.is_right_index[split.offending[split.offending_has_plane_vertex[1]]], axis=-1) == 2].shape[0]
-        # Case 2: The two non-plane vertices are in different groups, we split the triangle and put subtriangle in each group
-        t1p_split = split.offending[split.offending_has_plane_vertex[1]][numpy.logical_and(numpy.count_nonzero(split.is_left_index[split.offending[split.offending_has_plane_vertex[1]]], axis=-1) == 1, numpy.count_nonzero(split.is_right_index[split.offending[split.offending_has_plane_vertex[1]]], axis=-1) == 1)].shape[0]
-        split.distribution[0] += t1p_split
-        split.distribution[1] += t1p_split
-        split.separation_count += t1p_split
-        # 0 plane vertices: put one triangle in the lonely vertex's group and 2 triangles into the couple vertices' group
-        tl_left = numpy.count_nonzero(numpy.count_nonzero(split.is_left_index[split.offending[split.offending_has_plane_vertex[0]]], axis=-1) == 1)
-        tl_right = numpy.count_nonzero(numpy.count_nonzero(split.is_right_index[split.offending[split.offending_has_plane_vertex[0]]], axis=-1) == 1)
-        split.distribution[0] += tl_left + 2 * tl_right
-        split.distribution[1] += tl_right + 2 * tl_left
-        split.separation_count += split.offending_has_plane_vertex[0].shape[0] * 3
-
-        if split.separation_count < split_separation_count:
-            split_separation_count = split.separation_count
-            split_dim = dim
-
-    split = split_info[split_dim]
-    dim = split_dim
-    new_vertices = numpy.array([
-        storage.float[split.triangle_order[0]] + split.plane_intersection[0][:, None] * (storage.float[split.triangle_order[1]] - storage.float[split.triangle_order[0]]),
-        storage.float[split.triangle_order[0]] + split.plane_intersection[1][:, None] * (storage.float[split.triangle_order[2]] - storage.float[split.triangle_order[0]]),
-    ])
-    # Append case3 in the existing groups
-    numpy.hstack([split.groups[0], split.offending[split.case3[split.case3_dir == False]]])
-    numpy.hstack([split.groups[1], split.offending[split.case3[split.case3_dir == True]]])
-
-    new_group_triangle = [numpy.array([], dtype=numpy.float32), numpy.array([], dtype=numpy.float32)]
-    new_group_triangle_index = [numpy.array([], dtype=split.groups[0].dtype), numpy.array([], dtype=split.groups[1].dtype)]
-    # new_triangle_vertices = numpy.array()
-
-    # Case 4: Only one of the new vertices is used, the other matches an existing triangle vertex
-    case4_plane_vertex_index = numpy.argwhere(numpy.abs(storage.float[split.triangle_index[split.case4]][:, :, split_dim] - split.plane_factor) < epsilon)[:, 1]
-    case4_other_vertex_index = numpy.tile([0, 1, 2], split.case4.shape[0]).reshape(split.case4.shape[0], 3)
-    case4_other_vertex_index = case4_other_vertex_index[numpy.arange(3) != case4_plane_vertex_index[:, None]].reshape((case4_other_vertex_index.shape[0], case4_other_vertex_index.shape[1]-1))
-    case4_intersection_index = numpy.argwhere(numpy.logical_and(split.plane_intersection.T[split.case4] >= 0.0, 1.0 - split.plane_intersection.T[split.case4] >= epsilon))
-    case4_intersection_factor = split.plane_intersection.T[split.case4][case4_intersection_index[:, 0], case4_intersection_index[:, 1]]
-    case4_float_plane_vertex = storage.float[split.triangle_order[case4_plane_vertex_index, split.case4]]
-    case4_float_new_vertex = new_vertices[case4_intersection_index[:, 1], split.case4]
-    case4_min_vertex_index = numpy.argwhere(storage.float[split.triangle_order[case4_other_vertex_index, split.case4]][:, :, split_dim] < split.plane_factor)
-    case4_max_vertex_index = numpy.argwhere(storage.float[split.triangle_order[case4_other_vertex_index, split.case4]][:, :, split_dim] >= split.plane_factor)
-    case4_min_vertex_index = case4_other_vertex_index[case4_min_vertex_index[:, 0], case4_min_vertex_index[:, 1]]
-    case4_max_vertex_index = case4_other_vertex_index[case4_max_vertex_index[:, 0], case4_max_vertex_index[:, 1]]
-    case4_float_min_vertex = storage.float[split.triangle_index[split.case4][numpy.arange(split.case4.shape[0]), case4_min_vertex_index]]
-    case4_float_max_vertex = storage.float[split.triangle_index[split.case4][numpy.arange(split.case4.shape[0]), case4_min_vertex_index]]
-    case4_min_triangles = numpy.dstack([case4_float_plane_vertex, case4_float_new_vertex, case4_float_min_vertex])
-    case4_max_triangles = numpy.dstack([case4_float_plane_vertex, case4_float_new_vertex, case4_float_max_vertex])
-    pass
-    
-    assert case4_plane_vertex_index.shape[0] == split.case4.shape[0]
-    assert case4_new_vertex_index.shape[0] == split.case4.shape[0]
-    float_case4_new_vertex = new_vertices[case4_new_vertex_index, split.case4]
-    case4_plane_vertex = split.triangle_index[split.case4, case4_plane_vertex_index]
-    case4_other_index = case4_other_index[numpy.arange(3) != case4_plane_vertex_index[:, None]].reshape((case4_other_index.shape[0], case4_other_index.shape[1]-1))
-    case4_other_vertex_index = split.triangle_index[split.case4, case4_other_index]
-    case4_other_rejections = split.triangle_rejections[split.offending[split.case4], case4_other_index]
-    case4_space_vertex_index = numpy.array([
-        numpy.argwhere(case4_other_rejections < 0.0)[:, 1],
-        numpy.argwhere(case4_other_rejections >= 0.0)[:, 1],
-    ])
-    assert numpy.count_nonzero(numpy.abs(case4_other_rejections.flatten()) < epsilon) == 0
-    
-    # TODO: Do this after finding all vertices to insert
-    # 1. We generate array (N, 3, K) where N is the number of new triangles, K=8 is the number of elements per vertex (vec3 position, vec3 normal, vec2 texcoord)
-    # 2. Then flatten the result to get a list of floats, pass the result to unique to get unique floats;
-    # 3. Optional: search current array for matching floats, that is make a N^2 grid of the new floats by numpy.abs(numpy.subtract.outer),
-    # then for all N [x, x] indices (matching in both dimensions), set to inf, then find all elements that are less than epsilon.
-    # For this new mapping, remove elements from the old mapping and make inverse index.
-    # 4. As shown below, use numpy.subtract.outer (memory intensive) to get mapping of new floats to old ones;
-    # 5. Remap the new traingles (N, 3, K) with the total_float index.
-    # 6. Remap the old triangles in storage.index into the total_float index.
-    # 7. Append the new triangles to old triangles in storage.index
-    new_vertices_float = new_vertices.reshape((-1, 3)).flatten()
-    new_float, new_vertices_index = numpy.unique(new_vertices_float, return_inverse=True)
-    new_vertices_index = new_vertices_index.reshape(new_vertices.shape)
-    new_float_offset = storage.float.shape[0]
-    new_old_float_remap = numpy.argwhere(numpy.abs(numpy.subtract.outer(new_float, storage.float)) < epsilon)
-    filter_float = numpy.delete(new_float, new_old_float_remap[:, 0])
-    filter_float_forward_index = numpy.delete(numpy.arange(new_float.shape[0]), new_old_float_remap[:, 0])
-    filter_float_index = numpy.arange(filter_float_forward_index.shape[0])
-    filter_float_forward_index = numpy.dstack([filter_float_forward_index, filter_float_index])[0]
-    del filter_float_index
-    filter_float_inverse_index = numpy.repeat(-1, new_float.shape[0])
-    filter_float_inverse_index[new_old_float_remap[:, 0]] = new_old_float_remap[:, 1]
-    filter_float_inverse_index[filter_float_forward_index[:, 0]] = new_float_offset + filter_float_forward_index[:, 1]
-    total_float = numpy.hstack([storage.float, filter_float])
-    total_float_forward_map = numpy.argsort(total_float)
-    total_float_inverse_map = numpy.argsort(total_float_forward_map)
-    assert numpy.count_nonzero(total_float[total_float_forward_map][total_float_inverse_map[storage.index]] != storage.float[storage.index]) == 0, 'Original data is not preserved'
-    pass
-
 class DataContext:
     def __init__(self, vertex_position_index=[0, 1, 2], vertex_normal_index=[3, 4, 5], vertex_texcoord_index=[6, 7]):
         self.vertex_position_index = numpy.array(vertex_position_index, dtype=numpy.int32)
         self.vertex_normal_index = numpy.array(vertex_normal_index, dtype=numpy.int32)
         self.vertex_texcoord_index = numpy.array(vertex_texcoord_index, dtype=numpy.int32)
 
-    def create_node(self, triangles):
+    def create_node(self, triangles, parent=None):
         assert isinstance(triangles, numpy.ndarray)
-        assert len(triangles.shape) == 3
+        assert len(triangles.shape) >= 2
         assert triangles.shape[1] == 3
-        assert triangles[:, :, self.vertex_position_index].shape[1:3] == (3, 3)
-        assert triangles[:, :, self.vertex_normal_index].shape[1:3] == (3, 3)
-        assert triangles[:, :, self.vertex_texcoord_index].shape[1:3] == (3, 2)
 
-        triangle_vertex_position = triangles[:, :, self.vertex_position_index]
-        plane_factor = numpy.median(numpy.swapaxes(triangle_vertex_position, 0, -1).reshape((3, -1)), axis=-1)
+        if triangles.shape[0] <= 6:
+            return Data(
+                is_split=False,
+                triangles=triangles,
+                depth = parent.depth + 1 if parent is not None else 1,
+                parent=parent
+            )
 
-        at_plane = numpy.array(list(numpy.abs(triangle_vertex_position[:, :, i] - plane_factor[i]) < epsilon for i in range(3)))
-        below = numpy.array(list(numpy.less.outer(triangle_vertex_position[:, :, i], plane_factor[i]) for i in range(3)))
-        below = numpy.logical_and(numpy.logical_not(at_plane), below)
-        above = numpy.array(list(numpy.greater_equal.outer(triangle_vertex_position[:, :, i], plane_factor[i]) for i in range(3)))
-        above = numpy.logical_and(numpy.logical_not(at_plane), above)
-        all_below = numpy.all(below, axis=-1)
-        all_above = numpy.all(above, axis=-1)
-        count_below = numpy.count_nonzero(all_below, axis=-1)
-        count_above = numpy.count_nonzero(all_above, axis=-1)
-        count_conflict = triangles.shape[0] - (count_below + count_above)
-        count_metric = numpy.array(list(count_conflict[i] if count_above[i] > 0 and count_below[i] > 0 else numpy.inf for i in range(3)))
-        split_dimension = numpy.argmin(count_metric)
-        assert count_metric[split_dimension] <= triangles.shape[0]
+        plane_factor = numpy.median(numpy.swapaxes(triangles.position, 0, -1).reshape((3, -1)), axis=-1)
+        vertex_group_mask = numpy.concatenate([
+            (triangles.position < plane_factor)[None],
+            (triangles.position > plane_factor)[None],
+            (numpy.abs(triangles.position - plane_factor) < epsilon)[None]
+        ], axis=0)
+        for i in range(2):
+            vertex_group_mask[i] = numpy.logical_and(vertex_group_mask[i], numpy.logical_not(vertex_group_mask[2]))
+        assert numpy.all(numpy.count_nonzero(vertex_group_mask, axis=0) == 1)
 
-        groups = [
-            triangles[numpy.argwhere(all_below[split_dimension])[:, 0]],
-            triangles[numpy.argwhere(all_above[split_dimension])[:, 0]],
-        ]
-
-        in_conflict = numpy.argwhere(numpy.logical_not(numpy.logical_or(all_below[split_dimension], all_above[split_dimension])))[:, 0]
-        ct_at_plane = at_plane[split_dimension, in_conflict]
-        ct_at_plane_count = numpy.count_nonzero(ct_at_plane, axis=-1)
+        groups = numpy.all(numpy.moveaxis(vertex_group_mask, -1, 0), axis=-1)
+        distribution = numpy.count_nonzero(groups, axis=-1)
+        distribution[:, 2] = triangles.shape[0] - numpy.sum(distribution, axis=-1)
+        split_dimension = numpy.argmin(distribution[:, 2])
+        print('%d: distrib_ini: %d :\n%r' % (parent.depth + 1 if parent is not None else 1, split_dimension, distribution))
+        distribution = distribution[split_dimension]
+        groups = groups[split_dimension]
+        vertex_group_mask = vertex_group_mask[:, :, :, split_dimension]
+        plane_factor = plane_factor[split_dimension]
+        group_mask = numpy.array([
+            groups[0],
+            groups[1],
+            numpy.all(numpy.logical_not(groups), axis=0)
+        ])
+        group_index = list(numpy.argwhere(mask)[:, 0] for mask in group_mask)
+        groups = list(triangles[group_mask[i]] for i in range(3))
+        # Groups 0 and 1 must not have vertices close to the split plane
+        assert numpy.count_nonzero(numpy.abs(groups[0].position[:, :, split_dimension] - plane_factor) < epsilon) == 0
+        assert numpy.count_nonzero(numpy.abs(groups[1].position[:, :, split_dimension] - plane_factor) < epsilon) == 0
+        
+        vertex_near_split_plane_mask = numpy.abs(groups[2].position[:, :, split_dimension] - plane_factor) < epsilon
+        vertex_near_split_plane_count = numpy.count_nonzero(vertex_near_split_plane_mask, axis=-1)
 
         # If the triangle has 2 vertices at the splitting plane:
         # insert the triangle into the group determined by the non-plane vertex
-        ct2_plane_vertices = numpy.argwhere(ct_at_plane_count == 2)[:,0]
-        numpy.vstack([groups[0], triangles[in_conflict[ct2_plane_vertices][numpy.any(below[split_dimension, in_conflict[ct2_plane_vertices]], axis=-1)]]])
-        numpy.vstack([groups[1], triangles[in_conflict[ct2_plane_vertices][numpy.any(above[split_dimension, in_conflict[ct2_plane_vertices]], axis=-1)]]])
+        ct2_index = group_index[2][vertex_near_split_plane_count == 2]
+        for i in range(2):
+            groups[i] = numpy.concatenate([
+                groups[i],
+                triangles[
+                    ct2_index[
+                        numpy.any(vertex_group_mask[i, ct2_index], axis=-1)
+                    ]
+                ]
+            ], axis=0)
 
         # If the triangle has 1 vertices at the splitting plane:
-        ct1_plane_vertex = numpy.argwhere(ct_at_plane_count == 1)[:,0]
-        ct1_below_count = numpy.count_nonzero(below[split_dimension, in_conflict[ct1_plane_vertex]], axis=-1)
-        ct1_above_count = numpy.count_nonzero(above[split_dimension, in_conflict[ct1_plane_vertex]], axis=-1)
+        ct1_index = group_index[2][vertex_near_split_plane_count == 1]
+        ct1_count = numpy.count_nonzero(vertex_group_mask[0:2, ct1_index], axis=-1)
+
         # If it has two vertices in the same group, add it to that group:
-        numpy.vstack([groups[0], triangles[in_conflict[ct1_plane_vertex[ct1_below_count == 2]]]])
-        numpy.vstack([groups[1], triangles[in_conflict[ct1_plane_vertex[ct1_above_count == 2]]]])
-        # Otherwise we split the triangle into two, a new vertex is inserted at the intersection point
-        # at the edge formed by non-plane vertices
-        assert numpy.all(numpy.argwhere(ct1_below_count == 1)[:,0] == numpy.argwhere(ct1_above_count == 1)[:,0])
-        ct1_triangle_index = in_conflict[ct1_plane_vertex[numpy.argwhere(ct1_below_count == 1)[:,0]]]
-        ct1_below_vertex = numpy.argwhere(below[split_dimension, in_conflict[ct1_plane_vertex]][ct1_below_count == 1])
-        ct1_below_vertex[:,0] = ct1_triangle_index[ct1_below_vertex[:,0]]
-        ct1_below_vertex_data = triangles[ct1_below_vertex[:,0], ct1_below_vertex[:,1]]
-        ct1_above_vertex = numpy.argwhere(above[split_dimension, in_conflict[ct1_plane_vertex]][ct1_below_count == 1])
-        ct1_above_vertex[:,0] = ct1_triangle_index[ct1_above_vertex[:,0]]
-        ct1_above_vertex_data = triangles[ct1_above_vertex[:,0], ct1_above_vertex[:,1]]
-        ct1_plane_vertex = numpy.argwhere(at_plane[split_dimension, ct1_triangle_index])
-        ct1_plane_vertex[:,0] = ct1_triangle_index[ct1_plane_vertex[:,0]]
-        ct1_plane_vertex_data = triangles[ct1_plane_vertex[:,0], ct1_plane_vertex[:,1]]
-        ct1_below_vertex_position = ct1_below_vertex_data[:,vertex_position]
-        ct1_above_vertex_position = ct1_above_vertex_data[:,vertex_position]
-        ct1_intersection_factor = (plane_factor[split_dimension] - ct1_below_vertex_position[:,split_dimension]) / (ct1_above_vertex_position[:,split_dimension] - ct1_below_vertex_position[:,split_dimension])
-        ct1_new_vertex_position = ct1_below_vertex_position + ct1_intersection_factor[:,None] * (ct1_above_vertex_position - ct1_below_vertex_position)
-        assert numpy.all(numpy.abs(ct1_new_vertex_position[:,split_dimension] - plane_factor[split_dimension]) < epsilon)
-        ct1_new_vertex_normal = ct1_intersection_factor[:,None] * ct1_above_vertex_data[:,vertex_normal] + (1.0 - ct1_intersection_factor)[:,None] * ct1_below_vertex_data[:,vertex_normal]
-        ct1_new_vertex_texcoord = ct1_intersection_factor[:,None] * ct1_above_vertex_data[:,vertex_texcoord] + (1.0 - ct1_intersection_factor)[:,None] * ct1_below_vertex_data[:,vertex_texcoord]
-        ct1_new_vertex_data = numpy.concatenate([ct1_new_vertex_position, ct1_new_vertex_normal, ct1_new_vertex_texcoord], axis=-1)
-        ct1_below_vertex_order = numpy.concatenate([ct1_below_vertex[:,1][:,None], ct1_plane_vertex[:,1][:,None]], axis=-1)
-        ct1_below_vertex_order = numpy.concatenate([ct1_below_vertex_order, 3 - numpy.sum(ct1_below_vertex_order, axis=-1)[:,None]], axis=-1)
-        # ct1_below_vertex_order = numpy.array(list(numpy.argwhere(ct1_below_vertex_order == i)[:,1] for i in range(3))).T
-        ct1_above_vertex_order = numpy.concatenate([ct1_above_vertex[:,1][:,None], ct1_plane_vertex[:,1][:,None]], axis=-1)
-        ct1_above_vertex_order = numpy.concatenate([ct1_above_vertex_order, 3 - numpy.sum(ct1_above_vertex_order, axis=-1)[:,None]], axis=-1)
-        # ct1_above_vertex_order = numpy.array(list(numpy.argwhere(ct1_above_vertex_order == i)[:,1] for i in range(3))).T
-        ct1_below_data = numpy.concatenate([ct1_below_vertex_data[:,None], ct1_plane_vertex_data[:,None], ct1_new_vertex_data[:,None]], axis=1)
-        ct1_above_data = numpy.concatenate([ct1_above_vertex_data[:,None], ct1_plane_vertex_data[:,None], ct1_new_vertex_data[:,None]], axis=1)
-        ct1_below_triangles = numpy.array(list(ct1_below_data[ct1_below_vertex_order == i] for i in range(3))).swapaxes(0, 1)
-        ct1_above_triangles = numpy.array(list(ct1_above_data[ct1_above_vertex_order == i] for i in range(3))).swapaxes(0, 1)
-        numpy.vstack([groups[0], ct1_below_triangles])
-        numpy.vstack([groups[1], ct1_above_triangles])
+        for i in range(2):
+            groups[i] = numpy.concatenate([
+                groups[i],
+                triangles[ct1_index[ct1_count[i] == 2]]
+            ], axis=0)
+
+        assert numpy.all((ct1_count[0] == 1) == (ct1_count[1] == 1))
+        ct1_split_index = ct1_index[ct1_count[0] == 1]
+        ct1_plane_vertex_mask = numpy.abs(triangles[ct1_split_index].position[:,:,split_dimension] - plane_factor) < epsilon
+        ct1_min_vertex_mask = triangles[ct1_split_index].position[:,:,split_dimension] <= plane_factor - epsilon
+        ct1_max_vertex_mask = triangles[ct1_split_index].position[:,:,split_dimension] >= plane_factor + epsilon
+        assert numpy.all(numpy.count_nonzero(ct1_plane_vertex_mask, axis=-1) == 1)
+        assert numpy.all(numpy.count_nonzero(ct1_min_vertex_mask, axis=-1) == 1)
+        assert numpy.all(numpy.count_nonzero(ct1_max_vertex_mask, axis=-1) == 1)
+        ct1_split_factor = (
+            plane_factor - triangles[ct1_split_index][ct1_min_vertex_mask].position[:, split_dimension]
+        ) / (
+            triangles[ct1_split_index][ct1_max_vertex_mask].position[:, split_dimension] - triangles[ct1_split_index][ct1_min_vertex_mask].position[:, split_dimension]
+        )
+        ct1_triangle_float = triangles[ct1_split_index].view((numpy.float64, 8))
+        ct1_new_vertices = ((1.0 - ct1_split_factor)[:,None] * ct1_triangle_float[ct1_min_vertex_mask] + ct1_split_factor[:,None] * ct1_triangle_float[ct1_max_vertex_mask]).astype(numpy.float64).view(vertex_attributes)[:,0].view(numpy.recarray)
+        ct1_new_min_triangle = numpy.concatenate([
+            ct1_new_vertices[:,None],
+            triangles[ct1_split_index][ct1_plane_vertex_mask][:,None],
+            triangles[ct1_split_index][ct1_min_vertex_mask][:,None],
+        ], axis=-1).view(numpy.recarray)
+        ct1_new_max_triangle = numpy.concatenate([
+            ct1_new_vertices[:,None],
+            triangles[ct1_split_index][ct1_plane_vertex_mask][:,None],
+            triangles[ct1_split_index][ct1_min_vertex_mask][:,None],
+        ], axis=-1).view(numpy.recarray)
+        ct1_split_triangle_normal = normalize(numpy.cross(triangles[ct1_split_index, 2].position - triangles[ct1_split_index, 0].position, triangles[ct1_split_index, 1].position - triangles[ct1_split_index, 0].position))
+        ct1_new_min_triangle_normal = normalize(numpy.cross(ct1_new_min_triangle[:, 2].position - ct1_new_min_triangle[:, 0].position, ct1_new_min_triangle[:, 1].position - ct1_new_min_triangle[:, 0].position))
+        ct1_new_max_triangle_normal = normalize(numpy.cross(ct1_new_max_triangle[:, 2].position - ct1_new_max_triangle[:, 0].position, ct1_new_max_triangle[:, 1].position - ct1_new_max_triangle[:, 0].position))
+        ct1_new_min_triangle_flip_mask = array_dot(ct1_new_min_triangle_normal, ct1_split_triangle_normal) < 0
+        ct1_new_max_triangle_flip_mask = array_dot(ct1_new_max_triangle_normal, ct1_split_triangle_normal) < 0
+        ct1_new_min_triangle[ct1_new_min_triangle_flip_mask] = numpy.flip(ct1_new_min_triangle[ct1_new_min_triangle_flip_mask], axis=-1)
+        ct1_new_max_triangle[ct1_new_max_triangle_flip_mask] = numpy.flip(ct1_new_max_triangle[ct1_new_max_triangle_flip_mask], axis=-1)
+        numpy.concatenate([
+            groups[0],
+            ct1_new_min_triangle
+        ], axis=0)
+        numpy.concatenate([
+            groups[1],
+            ct1_new_max_triangle
+        ], axis=0)
 
         # If the triangle has 0 vertices at the splitting plane (most common case):
-        # 1. Identify the lonely vertex and lonely direction
-        # 2. The vertex couple and vertex couple direction are opposite of the lonely vertex
-        # 3. Get the two edges of the vertex couple with the lonely vertex
-        # 4. Intersect the two edges with the plane to generate two plane vertices
-        # 5. Create one new triangle from the plane vertices and the lonely vertex
-        # 6. Create two new triangles for the quadliteral formed by the plane vertices and vertex couple
-        # Note: this can be done in two ways, as there are two diagonals in a quadliteral
-        # For all intent and purposes these are equivalent up to the vertex order;
-        # The result will always append one triangle in one of the groups and two triangles in the other.
+        # Out of 3 vertices, 2 will be on one side of the splitting plane (a.k.a. couple), the other vertex (a.k.a. lonely) will be on the other side
+        # We create 2 new vertices at the intersection point of the plane and the edges between the lonely vertex and the vertex couple.
+        # We create 3 new triangles: one with the new plane vertices and the lonely vertex and two for triangulization of the quadliteral
+        # between the 4 vertex: the 2 new plane vertices and the vertex couple.
+        ct0_index = group_index[2][vertex_near_split_plane_count == 0]
+        ct0_lonely_vertex_index = numpy.argwhere((triangles[ct0_index].position[:,:,split_dimension] < plane_factor) == numpy.logical_xor.reduce((triangles[ct0_index].position[:,:,split_dimension] < plane_factor), axis=-1)[:,None])[:,1]
+        ct0_couple_vertex_index = numpy.tile(numpy.arange(3), ct0_lonely_vertex_index.shape[0]).reshape((-1, 3))[numpy.not_equal.outer(ct0_lonely_vertex_index, numpy.arange(3))].reshape((-1, 2))
+        assert not (numpy.any(ct0_couple_vertex_index[:,0] == ct0_lonely_vertex_index) or numpy.any(ct0_couple_vertex_index[:,1] == ct0_lonely_vertex_index))
+        assert not numpy.any(numpy.logical_xor(triangles[ct0_index, ct0_couple_vertex_index[:, 0]].position[:, split_dimension] < plane_factor, triangles[ct0_index, ct0_couple_vertex_index[:, 1]].position[:, split_dimension] < plane_factor)), 'vertex_couple vertices must be in the same group'
+        ct0_triangle_normal = normalize(numpy.cross(triangles[ct0_index, 2].position - triangles[ct0_index, 0].position, triangles[ct0_index, 1].position - triangles[ct0_index, 0].position))
+        ct0_split_factor = numpy.array(list(
+            (
+                plane_factor - triangles[ct0_index].position[(numpy.arange(ct0_index.shape[0]), ct0_lonely_vertex_index)][:, split_dimension]
+            ) / (
+                triangles[ct0_index].position[(numpy.arange(ct0_index.shape[0]), ct0_couple_vertex_index[:,i])][:, split_dimension] - triangles[ct0_index].position[(numpy.arange(ct0_index.shape[0]), ct0_lonely_vertex_index)][:, split_dimension]
+            )
+            for i in range(2)
+        ))
+        ct0_triangle_float = triangles[ct0_index].view((numpy.float64, 8))
+        ct0_new_vertices = numpy.array(list(
+            (1.0 - ct0_split_factor[i])[:,None] * ct0_triangle_float[(numpy.arange(ct0_lonely_vertex_index.shape[0]), ct0_lonely_vertex_index)] + ct0_split_factor[i][:,None] * ct0_triangle_float[(numpy.arange(ct0_couple_vertex_index.shape[0]), ct0_couple_vertex_index[:,i])]
+            for i in range(2)
+        )).astype(numpy.float64).view(vertex_attributes)[:,:,0].view(numpy.recarray)
+        ct0_new_lonely_triangle = numpy.concatenate([
+            triangles[ct0_index, ct0_lonely_vertex_index][:,None],
+            ct0_new_vertices.T,
+        ], axis=-1).view(numpy.recarray)
+        ct0_new_lonely_triangle_normal = normalize(numpy.cross(ct0_new_lonely_triangle[:,2].position - ct0_new_lonely_triangle[:,0].position, ct0_new_lonely_triangle[:,1].position - ct0_new_lonely_triangle[:,0].position))
+        ct0_new_lonely_triangle_flip_mask = array_dot(ct0_new_lonely_triangle_normal, ct0_triangle_normal) < 0.0
+        ct0_new_lonely_triangle[ct0_new_lonely_triangle_flip_mask] = numpy.flip(ct0_new_lonely_triangle[ct0_new_lonely_triangle_flip_mask], axis=-1)
+        ct0_new_plane_triangle = numpy.concatenate([
+            triangles[(ct0_index, ct0_couple_vertex_index[:,0])][:,None],
+            ct0_new_vertices.T
+        ], axis=-1).view(numpy.recarray)
+        ct0_new_plane_triangle_normal = normalize(numpy.cross(ct0_new_plane_triangle[:,2].position - ct0_new_plane_triangle[:,0].position, ct0_new_plane_triangle[:,1].position - ct0_new_plane_triangle[:,0].position))
+        ct0_new_plane_triangle_flip_mask = array_dot(ct0_new_plane_triangle_normal, ct0_triangle_normal) < 0.0
+        ct0_new_plane_triangle[ct0_new_plane_triangle_flip_mask] = numpy.flip(ct0_new_plane_triangle[ct0_new_plane_triangle_flip_mask], axis=-1)
+        ct0_new_couple_triangle = numpy.concatenate([
+            triangles[(ct0_index, ct0_couple_vertex_index[:,0])][:,None],
+            triangles[(ct0_index, ct0_couple_vertex_index[:,1])][:,None],
+            ct0_new_vertices[1][:,None],
+        ], axis=-1).view(numpy.recarray)
+        ct0_new_couple_triangle_normal = normalize(numpy.cross(ct0_new_couple_triangle[:,2].position - ct0_new_couple_triangle[:,0].position, ct0_new_couple_triangle[:,1].position - ct0_new_couple_triangle[:,0].position))
+        ct0_new_couple_triangle_flip_mask = array_dot(ct0_new_couple_triangle_normal, ct0_triangle_normal) < 0.0
+        ct0_new_couple_triangle[ct0_new_couple_triangle_flip_mask] = numpy.flip(ct0_new_couple_triangle[ct0_new_couple_triangle_flip_mask], axis=-1)
+        ct0_new_triangles = numpy.concatenate([ct0_new_lonely_triangle, ct0_new_plane_triangle, ct0_new_couple_triangle], axis=0).view(numpy.recarray)
+        # assert not numpy.any(numpy.abs(numpy.mean(ct0_new_triangles.position[:,:,split_dimension], axis=-1) - plane_factor) < epsilon)
+        ct0_group_mask = (numpy.mean(ct0_new_triangles.position[:,:,split_dimension], axis=-1) >= plane_factor).astype('i')
+        for i in range(2):
+            groups[i] = numpy.concatenate([
+                groups[i],
+                ct0_new_triangles[ct0_group_mask == i]
+            ], axis=0)
 
-        # If the triangle has all 3 vertices at the splitting plane (very rare case):
-        # Put the triangle into the group with smaller number of triangles to increase the balance
+        # A very rare case: the median triangle might be aligned with the axes, thus all 3 vertices are plane.
+        # In general we can put this triangles into any group
+        ct3_index = group_index[2][vertex_near_split_plane_count == 3]
+        if ct3_index.shape[0] > 0:
+            raise NotImplementedError('Handling of rare 3-plane-vertices median triangle postponed until a model is found to need this case')
+        
+        new_distribution = numpy.array([g.shape[0] for g in groups[0:2]])
+        print('%d: distrib_cur[%d, %d]' % (parent.depth + 1 if parent is not None else 1, *new_distribution))
+        if (numpy.sum(new_distribution) <= numpy.sum(distribution)) or (parent is not None and numpy.sum(parent.distribution) <= numpy.sum(new_distribution)):
+            return Data(
+                is_split=False,
+                triangles=triangles,
+                depth = parent.depth + 1 if parent is not None else 1,
+                parent=parent
+            )
+        
 
-        # Next step: ensure all vertices fit their corresponding group
-        # Note: newly create vertices can differ from plane_factor up to epsilon in any direction.
-        # Since the groups has been assigned, we move all vertices up to epsilon to fit the group sub-space.
+        del groups[2]
+        for i in range(2):
+            groups[i] = groups[i].view(numpy.recarray)
 
-        # Next, Optionally, reassign all floating-points to fit a grid of epsilon item size. This can be done with numpy.argwhere, numpy.diff and indexing (perhaps).
-        # This will allow easy comparison of vertices, normals and texcoords, so we can store those in a separate arrays.
-        # This will also allow triangle vertices to be set of indices to the corresponding attributes (for example 3 uint32 can point to [0] = position, [1] = normal, [2] = texcoord)
-        # Finally, the triangle data can be 3 uint32 pointing to 3 vertices.
-        # The idea is to minimize the repetitions of values for enclosed space. A mesh having enclosed space will definitely have triangle sharing vertices as well as vertices sharing positions.
-        # A container node can be given of set of (2, 3) indices to positions f32[3] specifying the min point and max point of a box.
-        # Since those will be selected from coordinates of some vertex positions, f32 will definitely be reusable.
-        # Optional: Finally, when a 3-plets or pair indices data is already found in data_int, repetition can be avoided and pointers can be reused.
-        # Note: But this should not be done in expensive of additional memory indirections. It should only be used for existing memory indirections.
+        # This will throw if any plane vertex do not lie exactly on the splitting plane.
+        # If throws, we can write code to move all f32 epsilon proximity to the plane to match the plane, so that it never step outside the bounding box
+        # assert not numpy.any(numpy.count_nonzero(numpy.abs(groups[i].position[numpy.abs(groups[i].position[:,:,split_dimension] - plane_factor) < epsilon][:,split_dimension] - plane_factor) > 0.0))
+        
+        node = Data(
+            split_dimension=split_dimension,
+            split_factor=plane_factor,
+            children=[],
+            parent=parent,
+            depth = parent.depth + 1 if parent is not None else 1,
+            distribution = numpy.array([g.shape[0] for g in groups[0:2]]),
+            is_split=True
+        )
 
-        # Minimizing models can improve loading of the models over the internet (but ServiceWorker offline cache should be used when available).
-        # However, this should be carefully considered against the time it requires for scene to raytrace. The target is <16.66ms for 1080p
-        # The optimization should guarantee O(ln(N)) order of complexity with model data maximum 2 times the original binary data.
-        pass
+        max_triangles = -1
+        for group in groups:
+            child = self.create_node(group, node)
+            if not child.is_split:
+                max_triangles = max(max_triangles, child.triangles.shape[0])
+            else:
+                max_triangles = max(max_triangles, child.max_triangles)
+            node.children.append(self.create_node(group, node))
+        node.max_triangles = max_triangles
+
+        return node
 
 def _main():
     count_vertices = int.from_bytes(sys.stdin.buffer.read(4), byteorder='little')
@@ -322,12 +278,14 @@ def _main():
     #     texcoords=data_texture_coords,
     #     triangles=data_triangles
     # )
-    triangles = numpy.concatenate([data_vertices[data_triangles[:, :, 0]], data_normals[data_triangles[:, :, 1]], data_texture_coords[data_triangles[:, :, 2]]], axis=-1) 
+    triangles = numpy.concatenate([data_vertices[data_triangles[:, :, 0]], data_normals[data_triangles[:, :, 1]], data_texture_coords[data_triangles[:, :, 2]]], axis=-1)
+    triangles = numpy.core.records.fromarrays([triangles[:, :, [0, 1, 2]], triangles[:, :, [3, 4, 5]], triangles[:, :, [6, 7]]], dtype=vertex_attributes)
     # Can be modified with insertion of new floating point numbers or triangles
     # storage = create_storage(triangles)
     # root_node = create_node(storage, numpy.arange(storage.index.shape[0]))
     context = DataContext()
-    context.create_node(triangles)
+    root_node = context.create_node(triangles)
+    print(root_node.max_triangles)
     pass
 
 if __name__ == '__main__':
