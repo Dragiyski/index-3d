@@ -122,6 +122,23 @@ def compile_node(triangle_data, selection_index, parent = None):
         # If a node does not result in at least 2 child nodes, we try another dimension and/or split factor
     return None
 
+def validate_node(node, triangle_count):
+    triangle_set = set()
+    def validate_recursive(node):
+        if node.is_container:
+            for child in node.children:
+                validate_recursive(child)
+        else:
+            for index in node.index:
+                if index in triangle_set:                    
+                    raise ValueError(f'An index node contains a duplicate triangle: {index}')
+                triangle_set.add(index)
+        return True
+    if not validate_recursive(node):
+        return False
+    if len(triangle_set) != triangle_count:
+        raise ValueError(f'An index node contains different number of triangles, expected: {triangle_count}, got {len(triangle_set)}')
+
 class TreeStorage:
     def __init__(self, root):
         self.byte_list = []
@@ -145,7 +162,7 @@ class TreeStorage:
         if node.is_container:
             self.append(b'node')
         else:
-            self.append(b'face')
+            self.append(b'leaf')
         for value in node.bounding_box.flat:
             self.append(struct.pack('<f', value))
         if node.is_container:
@@ -180,8 +197,8 @@ def _main():
 
     root_node = compile_node(triangles, numpy.arange(triangles.shape[0]))
     data_tree = TreeStorage(root_node)
-    print(root_node)
-    sys.stdout.write(b''.join(data_tree.byte_list))
+    validate_node(root_node, triangles.shape[0])
+    sys.stdout.buffer.write(b''.join(data_tree.byte_list))
 
 if __name__ == '__main__':
     _main()
