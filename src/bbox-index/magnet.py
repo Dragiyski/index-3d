@@ -1,5 +1,6 @@
 import sys
 import numpy
+import struct
 
 class Data:
     def __init__(self, **kwargs):
@@ -14,7 +15,7 @@ def compile_node(triangle_data, selection, parent = None):
         vertex_list.min(axis = 0)[None],
         vertex_list.max(axis = 0)[None]
     ], axis = 0)
-    print(f'Depth: {0 if parent is None else (parent.depth + 1)}, Input: {len(selection)}')
+    print(f'Depth: {0 if parent is None else (parent.depth + 1)}, Input: {len(selection)}', file=sys.stderr)
     if len(selection) <= 6:
         return Data(
             is_container = False,
@@ -79,9 +80,67 @@ def compile_node(triangle_data, selection, parent = None):
         if len(children) > 1:
             node.children = children
             node.distribution = count
+            index = [child.index for child in children]
+            while len(index) >= 2:
+                index = [numpy.union1d(index[0], index[1])] + index[2:]
+            node.index = index[0]
             node.max_depth = 1 + numpy.maximum.reduce(list(c.max_depth for c in node.children))
             return node
     pass
+
+class MeshIndex:
+    def __init__(self, triangles):
+        self.float = [0.0]
+        self.int = [0]
+        self.object = [[struct.unpack('=I', b'null')[0], 0, 0, 0]]
+        self.tree = [[0, 0, 0, 0]]
+        self.node_map = {}
+        self.triangles = triangles
+        self.triangle_map = {}
+
+    def insert_node(self, node):
+        if node in self.node_map:
+            return
+        entry = self.node_map[node] = Data(
+            tree_index = len(self.tree),
+            object_index = len(self.object)
+        )
+        float_index = len(self.float)
+        int_index = len(self.int)
+        object_entry = [
+            struct.unpack('=I', b'abox')[0],
+            0 if node.is_container else 1,
+            float_index,
+            int_index
+        ]
+        parent_index = node.parent.children.index(node) if node.parent is not None else None
+        prev_sibling = node.parent.children[parent_index - 1] if node.parent is not None and parent_index > 0 else None
+        tree_entry = [
+            entry.object_index,
+            self.node_map[node.parent].tree_index if node.parent is not None else 0,
+            self.node_map[prev_sibling].tree_index if prev_sibling is not None else 0,
+            0
+        ]
+        if prev_sibling is not None:
+            self.tree[self.node_map[prev_sibling].tree_index][3] = entry.tree_index
+        self.object.append(object_entry)
+        self.tree.append(tree_entry)
+        for value in node.bounding_box.flat:
+            self.float.append(value)
+        
+        if node.is_container:
+            self.int.append(len(node.children))
+            for i in range(len(node.children)):
+                self.int.append(0)
+            for child in node.children:
+                self.insert_node(child)
+            for i in range(len(node.children)):
+                self.int[int_index + 1 + i] = self.node_map[node.children[i]].tree_index
+        else:
+            self.int.append(len(node.index))
+            for index in node.index:
+                assert index >= 0 and index < self.triangles.shape[0]
+                self.int.append(index)
 
 
 def _main():
@@ -105,6 +164,25 @@ def _main():
     root_node = compile_node(triangles, numpy.arange(triangles.shape[0]))
     # Root node now contains (potentially semi-balanced/non-balanced tree)
     pass
+
+    data = MeshIndex(triangles)
+    data.insert_node(root_node)
+    data.int = numpy.array(data.int, dtype=numpy.uint32)
+    data.float = numpy.array(data.float, dtype=numpy.float32)
+    data.object = numpy.array(data.object, dtype=numpy.uint32)
+    data.tree = numpy.array(data.tree, dtype=numpy.uint32)
+
+    sys.stdout.buffer.write(data.tree.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(data.object.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(data.int.shape[0].to_bytes(4, 'little'))
+    sys.stdout.buffer.write(data.float.shape[0].to_bytes(4, 'little'))
+
+    sys.stdout.buffer.write(data.node_map[root_node].tree_index.to_bytes(4, 'little'))
+
+    sys.stdout.buffer.write(data.tree.tobytes('C'))
+    sys.stdout.buffer.write(data.object.tobytes('C'))
+    sys.stdout.buffer.write(data.int.tobytes('C'))
+    sys.stdout.buffer.write(data.float.tobytes('C'))
 
 
 if __name__ == '__main__':
