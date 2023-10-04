@@ -136,8 +136,16 @@ def split_node(triangles, node):
     box_size = node.bounding_box[1] - node.bounding_box[0]
     assert numpy.all(box_size >= epsilon)
     for selected_axis in numpy.flip(numpy.argsort(box_size)):
-        # split_factor = numpy.mean(vertex_list[:, selected_axis])
-        split_factor = numpy.median(vertex_list[:, selected_axis])
+        # mean seems to provide better results than median for the wooden table.
+        # A potential problem is that it is possible neither mean, nor median to have good results;
+        # The wooden table specifically have a shape of a hinge on a plank.
+        # The hinge is small, but contains a lot of triangles
+        # The plank is large and contain less triangles
+        # The shape is aligned with the grid, and can be split in 7-by-6 triangles
+        # if the splitting occurs at axis=1 but heavily skewed to the negative side.
+        # Neither mean, nor median produce proper split factor.
+        split_factor = numpy.mean(vertex_list[:, selected_axis])
+        # split_factor = numpy.median(vertex_list[:, selected_axis])
         if node.bounding_box[1, selected_axis] - split_factor < epsilon or split_factor - node.bounding_box[0, selected_axis] < epsilon:
             continue
         children = [

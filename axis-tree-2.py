@@ -105,10 +105,60 @@ def compile_node(triangle_data, selection_index, parent = None):
             node.children = children
             node.split_factor = split_factor
             node.distribution = distribution
+            node.is_container = True
             print('+ %d: %r' % (node.depth, list(node.distribution)))
             return node
+        numpy.searchsorted
     return None
 
+def insert_float_in_storage(storage, value):
+    index_min = 0
+    index_max = len(storage.float)
+    while index_max > index_min:
+        index_mid = (index_max + index_min) // 2
+        value_mid = storage.float[index_mid]
+        diff_mid = value - value_mid
+        if diff_mid <= -epsilon:
+            index_max = index_mid
+        elif diff_mid >= epsilon:
+            index_min = index_mid + 1
+        else:
+            index_min = index_mid
+            break
+    storage.float.insert(index_min, value)
+    return index_min
+
+def insert_float_ndarray_in_storage(storage, ndarray):
+    index_list = numpy.array(list(insert_float_in_storage(storage, value) for value in ndarray.ravel()))
+    return index_list.reshape(ndarray.shape)
+
+OBJECT_TYPE_BOUNDING_BOX = 1
+OBJECT_TYPE_MESH_TRIANGLE = 2
+
+def insert_node_in_storage(storage, node):
+    float_ref = len(storage.float)
+    int_ref = len(storage.int)
+    object_ref = len(storage.object)
+    tree_ref = len(storage.tree)
+    if node.is_container:
+        storage.object.append([OBJECT_TYPE_BOUNDING_BOX, -1, -1, float_ref])
+        storage.float.extend(list(node.bounding_box.ravel()))
+        storage.tree.append([-1, -1, -1, object_ref])
+        node.tree_ref = tree_ref
+        if node.parent is not None:
+            storage.tree[tree_ref][0] = node.parent.tree_ref
+        child_ref_list = []
+        for child in node.children:
+            child_ref_list.append(insert_node_in_storage(storage, child))
+        if len(child_ref_list) > 0:
+            storage.object[object_ref][1] = child_ref_list[0]
+        for i in range(1, len(child_ref_list)):
+            storage.tree[child_ref_list[i]][1] = child_ref_list[i - 1]
+        for i in range(len(child_ref_list) - 1):
+            storage.tree[child_ref_list[i]][2] = child_ref_list[i + 1]
+    else:
+        storage.object.append([OBJECT_TYPE_MESH_TRIANGLE, -1, -1, float_ref])
+    pass
 
 def _main():
     count_vertices = int.from_bytes(sys.stdin.buffer.read(4), byteorder = 'little')
@@ -122,13 +172,50 @@ def _main():
     data_triangles = numpy.frombuffer(sys.stdin.buffer.read(count_faces * 3 * 3 * 4), dtype = numpy.uint32).reshape((count_faces, 3, 3))
 
     vertex_attributes = numpy.dtype([('position', '3f8'), ('normal', '3f8'), ('texcoord', '2f8')])
+    index_attributes = numpy.dtype([('position', '3u4'), ('normal', '3u4'), ('texcoord', '2u4')])
     triangles = numpy.core.records.fromarrays([
         data_vertices[data_triangles[:, :, 0]],
         data_normals[data_triangles[:, :, 1]],
         data_texture_coords[data_triangles[:, :, 2]],
     ], dtype = vertex_attributes)
+
     root_node = compile_node(triangles, numpy.arange(triangles.shape[0]))
-    pass
+
+    storage = Data(
+        float=[],
+        int=[],
+        object=[],
+        tree=[]
+    )
+
+    insert_node_in_storage(storage, root_node)
+
+    # float_list_ravel = triangles.view('<f8', numpy.ndarray).astype(numpy.float32).ravel()
+    # float_unique_value, float_list_index = numpy.unique(float_list_ravel, return_inverse=True)
+    # triangle_index = float_list_index.astype(numpy.uint32).view(index_attributes, numpy.recarray)
+    # triangle_index_count = float_unique_value.shape[0]
+    # triangle_position_index = triangle_index.position.astype(numpy.int64)
+    # triangle_position_flat_index = triangle_position_index[:, 0] * triangle_index_count * triangle_index_count + triangle_position_index[:, 1] * triangle_index_count + triangle_position_index[:, 2]
+    # triangle_normal_index = triangle_index.normal.astype(numpy.int64)
+    # triangle_normal_flat_index = triangle_normal_index[:, 0] * triangle_index_count * triangle_index_count + triangle_normal_index[:, 1] * triangle_index_count + triangle_normal_index[:, 2]
+    # triple_flat_index = numpy.concatenate([triangle_position_flat_index, triangle_normal_flat_index])
+    # triple_unique_flat_index, triple_value_index = numpy.unique(triple_flat_index, return_inverse = True)
+    # triangle_position_value_index = triple_value_index[:triangle_position_flat_index.shape[0]]
+    # triangle_normal_value_index = triple_value_index[triangle_position_flat_index.shape[0]:]
+    # triple_unique_index = numpy.concatenate([
+    #     (triple_unique_flat_index // (triangle_index_count * triangle_index_count))[:, None],
+    #     (triple_unique_flat_index % (triangle_index_count * triangle_index_count) // triangle_index_count)[:, None],
+    #     (triple_unique_flat_index % triangle_index_count)[:, None],
+    # ], axis = -1)
+    # triangle_texcoord_index = triangle_index.texcoord.astype(numpy.int64)
+    # triangle_texcoord_flat_index = triangle_texcoord_index[:, 0] * triangle_index_count + triangle_texcoord_index[:, 1]
+    # double_flat_index = triangle_texcoord_flat_index
+    # double_unique_flat_index, double_value_index = numpy.unique(double_flat_index, return_inverse = True)
+    # triangle_texcoord_value_index = double_value_index
+    # double_unique_index = numpy.concatenate([
+    #     (double_unique_flat_index // triangle_index_count)[:, None],
+    #     (double_unique_flat_index % triangle_index_count)[:, None],
+    # ], axis = -1)
 
 if __name__ == '__main__':
     _main()
