@@ -69,63 +69,25 @@ struct float_compare_less : public std::binary_function<T, T, bool> {
     }
 };
 
-class IteratorAllocIIFE {
-    NpyIter* iterator;
+template<typename T>
+struct floatlist_numpy_type;
 
-public:
-    IteratorAllocIIFE(NpyIter* iterator)
-        : iterator(iterator) { }
-    ~IteratorAllocIIFE() {
-        NpyIter_Deallocate(iterator);
-    }
+template<>
+struct floatlist_numpy_type<float> {
+    static const constexpr auto value = NPY_FLOAT32;
 };
 
-// bool floatlist_float32(PyArrayObject *input, PyObject **output_float, PyObject **output_index) {
-//     auto input_ndim = PyArray_NDIM(input);
-//     auto input_shape = PyArray_SHAPE(input);
-//     auto iterator = NpyIter_New(input, NPY_ITER_READONLY | NPY_ITER_MULTI_INDEX | NPY_ITER_C_INDEX | NPY_ITER_ZEROSIZE_OK, NPY_KEEPORDER, NPY_NO_CASTING, NULL);
-//     if (iterator == NULL) {
-//         return false;
-//     }
-//     IteratorAllocIIFE iterator_alloc(iterator);
-//     auto iterator_size = NpyIter_GetIterSize(iterator);
-//     if (iterator_size > 0) {
-//         auto iterator_next = NpyIter_GetIterNext(iterator, NULL);
-//         if (iterator_next == NULL) {
-//             return false;
-//         }
-//         auto get_multi_index = NpyIter_GetGetMultiIndex(iterator, NULL);
-//         if (get_multi_index == NULL) {
-//             return false;
-//         }
-//         npy_intp multi_index[input_ndim];
-//         auto iterator_data = NpyIter_GetDataPtrArray(iterator);
-//         do {
-//             get_multi_index(iterator, multi_index);
-//         } while (iterator_next(iterator));
-//     }
-//     uint64_t flat_size = 1;
-//     for (decltype(input_ndim) i = 0; i < input_ndim; ++i) {
-//         auto value = input_shape[i];
-//         if (value < 0) {
-//             PyErr_SetString(PyExc_IndexError, "The input NDArray shape has negative dimension");
-//             return false;
-//         }
-//         if (value == 0) {
-//             // Return two empty arrays:
-//             npy_intp size = 0;
-//             *output_float = PyArray_SimpleNew(1, &size, NPY_FLOAT32);
-//             *output_index = PyArray_SimpleNew(input_ndim, input_shape, NPY_UINT32);
-//             return true;
-//         }
-//     }
-// }
+template<>
+struct floatlist_numpy_type<double> {
+    static const constexpr auto value = NPY_FLOAT64;
+};
 
-bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObject** output_index) {
+template<typename T>
+bool floatlist_from_array(PyArrayObject* input, PyObject** output_value, PyObject** output_index) {
     auto input_ndim = PyArray_NDIM(input);
     auto input_shape = PyArray_SHAPE(input);
     static const auto max_index = std::numeric_limits<uint32_t>::max();
-    std::set<float, float_compare_less<float>> float_list;
+    std::set<T, float_compare_less<T>> float_list;
     static const auto iterator_deleter = [](NpyIter* iterator) {
         if (iterator != NULL) {
             NpyIter_Deallocate(iterator);
@@ -140,7 +102,7 @@ bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObj
         if (iterator_size <= 0) {
             // Empty iteration means empty output
             iterator_size = 0;
-            *output_value = PyArray_SimpleNew(1, &iterator_size, NPY_FLOAT32);
+            *output_value = PyArray_SimpleNew(1, &iterator_size, floatlist_numpy_type<T>::value);
             *output_index = PyArray_SimpleNew(input_ndim, input_shape, NPY_UINT32);
             return true;
         }
@@ -153,7 +115,7 @@ bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObj
             return false;
         }
         do {
-            auto value = *reinterpret_cast<float*>(*ptr_data);
+            auto value = *reinterpret_cast<T*>(*ptr_data);
             auto insert_result = float_list.insert(value);
             if (insert_result.second && float_list.size() > max_index) [[unlikely]] {
                 PyErr_SetString(PyExc_IndexError, "Float list exceeds u32 size");
@@ -191,9 +153,9 @@ bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObj
             return false;
         }
         do {
-            auto value = *reinterpret_cast<float*>(*ptr_data);
+            auto value = *reinterpret_cast<T*>(*ptr_data);
             auto location = float_list.find(value);
-            if (location == float_list.end()) {
+            if (location == float_list.end()) [[unlikely]] {
                 PyErr_SetString(PyExc_RuntimeError, "Unable to find the floating-point value in the search phase. The value should have been inserted in the insert phase.");
                 return false;
             }
@@ -214,7 +176,7 @@ bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObj
     }
     {
         npy_intp value_size = float_list.size();
-        auto value_array = (PyArrayObject *) PyArray_New(&PyArray_Type, 1, &value_size, NPY_FLOAT32, NULL, NULL, 0, NPY_ARRAY_OUT_ARRAY | NPY_ARRAY_ENSUREARRAY, NULL);
+        auto value_array = (PyArrayObject *) PyArray_New(&PyArray_Type, 1, &value_size, floatlist_numpy_type<T>::value, NULL, NULL, 0, NPY_ARRAY_OUT_ARRAY | NPY_ARRAY_ENSUREARRAY, NULL);
         if (value_array == NULL) {
             return false;
         }
@@ -225,7 +187,7 @@ bool floatlist_from_float32(PyArrayObject* input, PyObject** output_value, PyObj
         }
         npy_intp i = 0;
         for (auto it = float_list.begin(); it != float_list.end(); ++it, ++i) {
-            *reinterpret_cast<float *>(data + i * stride) = *it;
+            *reinterpret_cast<T *>(data + i * stride) = *it;
         }
         *output_value = (PyObject *)value_array;
     }
@@ -237,14 +199,18 @@ PyObject* floatlist_create(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O!", &PyArray_Type, &input)) {
         return NULL;
     }
+    PyObject *output_index, *output_data;
     if (PyArray_TYPE(input) == NPY_FLOAT32) {
-        PyObject *output_index, *output_data;
-        if (!floatlist_from_float32(input, &output_data, &output_index)) {
+        if (!floatlist_from_array<float>(input, &output_data, &output_index)) {
             return NULL;
         }
-        return PyTuple_Pack(2, output_data, output_index);
+    } else if (PyArray_TYPE(input) == NPY_FLOAT64) {
+        if (!floatlist_from_array<double>(input, &output_data, &output_index)) {
+            return NULL;
+        }
     } else {
         PyErr_SetString(PyExc_TypeError, "floatlist.from() unsupported NDArray dtype");
         return NULL;
     }
+    return PyTuple_Pack(2, output_data, output_index);
 }
