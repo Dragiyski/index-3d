@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools", "wheel", "oldest-supported-numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dragiyski-3d-index"
+version = "0.0.1"
+dependencies = [
+    "numpy"
+]
+authors = [
+    { name = "Plamen Dragiyski", email="plamen@dragiyski.org" }
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
